@@ -317,114 +317,110 @@ class ConnectionHandler:
         logger.info(f"[SOCKS5] Starting SOCKS5 handshake with {peer[0]}")
         
         try:
-            # SOCKS5 handshake: client sends version(0x05), nmethods, methods
-            if len(initial) >= 3 and initial[0] == 0x05:
-                # Respond with no authentication required
-                writer.write(b'\x05\x00')
-                await writer.drain()
-                logger.info("[SOCKS5] Sent auth response (0x05 0x00)")
-
-                # Read SOCKS5 request
-                request = await asyncio.wait_for(reader.read(262), timeout=10.0)
-                if not request or len(request) < 10:
-                    logger.info(f"[SOCKS5] Invalid request: {request}")
+            # initial contains: 05 01 00 (version, nmethods, methods)
+            # We need to read the rest: SOCKS5 request
+            
+            # Send auth response immediately
+            writer.write(b'\x05\x00')
+            await writer.drain()
+            logger.info("[SOCKS5] Sent auth response (0x05 0x00)")
+            
+            # Read SOCKS5 request - need to wait for it
+            request = b''
+            while len(request) < 10:  # Minimum SOCKS5 request size
+                chunk = await asyncio.wait_for(reader.read(262), timeout=10.0)
+                if not chunk:
+                    logger.info("[SOCKS5] Client closed connection during request")
                     writer.close()
                     return
+                request += chunk
+                logger.debug(f"[SOCKS5] Read {len(chunk)} bytes, total: {len(request)}")
+            
+            logger.info(f"[SOCKS5] Received request ({len(request)} bytes): {request[:20].hex()}")
+            
+            # Parse request
+            cmd = request[1]
+            atype = request[3]
+            offset = 4
+            
+            if atype == 1:  # IPv4
+                dst_ip = '.'.join(str(b) for b in request[offset:offset+4])
+                offset += 4
+            elif atype == 3:  # Domain
+                dst_len = request[offset]
+                dst_ip = request[offset+1:offset+1+dst_len].decode()
+                offset += 1 + dst_len
+            elif atype == 4:  # IPv6
+                dst_ip = ':'.join(hex(b)[2:] for b in request[offset:offset+16])
+                offset += 16
+            else:
+                logger.error(f"[SOCKS5] Unknown address type: {atype}")
+                writer.close()
+                return
 
-                # Parse request
-                cmd = request[1]
-                atype = request[3]
-                offset = 4
-                
-                if atype == 1:  # IPv4
-                    dst_ip = '.'.join(str(b) for b in request[offset:offset+4])
-                    offset += 4
-                elif atype == 3:  # Domain
-                    dst_len = request[offset]
-                    dst_ip = request[offset+1:offset+1+dst_len].decode()
-                    offset += 1 + dst_len
-                elif atype == 4:  # IPv6
-                    dst_ip = ':'.join(hex(b)[2:] for b in request[offset:offset+16])
-                    offset += 16
-                else:
-                    logger.error(f"[SOCKS5] Unknown address type: {atype}")
-                    writer.close()
-                    return
+            dst_port = struct.unpack('>H', request[offset:offset+2])[0]
+            logger.info(f"[SOCKS5] Request: cmd={cmd} addr={dst_ip}:{dst_port}")
 
-                dst_port = struct.unpack('>H', request[offset:offset+2])[0]
-                logger.info(f"[SOCKS5] Request: cmd={cmd} addr={dst_ip}:{dst_port}")
+            # Send success response
+            response = b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+            writer.write(response)
+            await writer.drain()
+            logger.info("[SOCKS5] Sent success response")
 
-                # Send success response
-                response = b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00'
-                writer.write(response)
-                await writer.drain()
-                logger.info("[SOCKS5] Sent success response")
+            # Connect to Telegram
+            tg_reader, tg_writer = await asyncio.wait_for(
+                asyncio.open_connection(self.config.telegram_host, self.config.telegram_port),
+                timeout=10.0
+            )
+            logger.info(f"[SOCKS5] Connected to Telegram {self.config.telegram_host}:{self.config.telegram_port}")
 
-                # Connect to Telegram
-                tg_reader, tg_writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.config.telegram_host, self.config.telegram_port),
-                    timeout=10.0
-                )
-                logger.info(f"[SOCKS5] Connected to Telegram {self.config.telegram_host}:{self.config.telegram_port}")
-
-                # Forward any remaining initial data to Telegram
-                # (after SOCKS5 request was parsed)
-                remaining = await reader.read(4096)
-                if remaining:
-                    logger.info(f"[SOCKS5] Forwarding {len(remaining)} bytes initial data to Telegram")
-                    tg_writer.write(remaining)
-                    await tg_writer.drain()
-
-                # Proxy bidirectionally
-                async def client_to_telegram():
+            # Proxy bidirectionally
+            async def client_to_telegram():
+                try:
+                    while True:
+                        data = await reader.read(4096)
+                        if not data:
+                            logger.info("[SOCKS5] Client closed")
+                            break
+                        tg_writer.write(data)
+                        await tg_writer.drain()
+                except Exception as e:
+                    logger.debug(f"[SOCKS5] C->T error: {type(e).__name__}")
+                finally:
                     try:
-                        while True:
-                            data = await reader.read(4096)
-                            if not data:
-                                logger.info("[SOCKS5] Client closed connection")
-                                break
-                            tg_writer.write(data)
-                            await tg_writer.drain()
-                    except Exception as e:
-                        logger.debug(f"[SOCKS5] C->T error: {type(e).__name__}: {e}")
-                    finally:
-                        try:
-                            tg_writer.close()
-                        except Exception:
-                            pass
+                        tg_writer.close()
+                    except Exception:
+                        pass
 
-                async def telegram_to_client():
+            async def telegram_to_client():
+                try:
+                    while True:
+                        data = await tg_reader.read(4096)
+                        if not data:
+                            logger.info("[SOCKS5] Telegram closed")
+                            break
+                        writer.write(data)
+                        await writer.drain()
+                except Exception as e:
+                    logger.debug(f"[SOCKS5] T->C error: {type(e).__name__}")
+                finally:
                     try:
-                        while True:
-                            data = await tg_reader.read(4096)
-                            if not data:
-                                logger.info("[SOCKS5] Telegram closed connection")
-                                break
-                            writer.write(data)
-                            await writer.drain()
-                    except Exception as e:
-                        logger.debug(f"[SOCKS5] T->C error: {type(e).__name__}: {e}")
-                    finally:
-                        try:
-                            writer.close()
-                        except Exception:
-                            pass
+                        writer.close()
+                    except Exception:
+                        pass
 
-                # Run both directions
-                await asyncio.gather(
-                    client_to_telegram(),
-                    telegram_to_client(),
-                    return_exceptions=True
-                )
-                logger.info("[-] SOCKS5 session ended")
+            await asyncio.gather(
+                client_to_telegram(),
+                telegram_to_client(),
+                return_exceptions=True
+            )
+            logger.info("[-] SOCKS5 session ended")
 
-        except asyncio.TimeoutError as e:
-            logger.error(f"[SOCKS5] Timeout: {e}")
+        except asyncio.TimeoutError:
+            logger.error("[SOCKS5] Timeout waiting for SOCKS5 request")
             writer.close()
         except Exception as e:
             logger.error(f"[SOCKS5] Error: {e}")
-            import traceback
-            traceback.print_exc()
             writer.close()
 
     async def _handle_mtproto(self, reader, writer, initial: bytes):

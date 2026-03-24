@@ -250,25 +250,40 @@ class ConnectionHandler:
             # Read more data to properly detect protocol
             # MTProto clients may send small packets first
             initial = b''
-            while len(initial) < 64:  # Read at least 64 bytes
-                chunk = await asyncio.wait_for(reader.read(4096), timeout=10.0)
-                if not chunk:
-                    break
-                initial += chunk
-                # Check if we have enough for detection
-                if len(initial) >= 8:
-                    if MTProtoFrame.is_mtproto(initial, self.config.secret):
-                        break
-                    if initial[0] == 0x16:  # TLS
-                        break
-                    if initial[0] == 0x05 and len(initial) >= 3:  # SOCKS5
+            timeout_count = 0
+            while len(initial) < 64 and timeout_count < 3:  # Read at least 64 bytes
+                try:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+                    if not chunk:
+                        logger.info("[-] Connection closed by client")
+                        writer.close()
+                        return
+                    initial += chunk
+                    logger.info(f"[Data] Received {len(chunk)} bytes, total: {len(initial)} bytes: {initial[:32].hex()}")
+                    
+                    # Check if we have enough for detection
+                    if len(initial) >= 8:
+                        if MTProtoFrame.is_mtproto(initial, self.config.secret):
+                            logger.info("[MTProto] Magic byte detected!")
+                            break
+                        if initial[0] == 0x16:  # TLS
+                            logger.info("[TLS] TLS handshake detected")
+                            break
+                        if initial[0] == 0x05 and len(initial) >= 3:  # SOCKS5
+                            logger.info("[SOCKS5] SOCKS5 detected")
+                            break
+                except asyncio.TimeoutError:
+                    timeout_count += 1
+                    logger.debug(f"Timeout {timeout_count}/3 waiting for data...")
+                    if timeout_count >= 3:
                         break
 
             if not initial:
+                logger.info("[-] No data received")
                 writer.close()
                 return
 
-            logger.info(f"[Data] First {len(initial)} bytes: {initial[:32].hex()}")
+            logger.info(f"[Data] Final detection data ({len(initial)} bytes): {initial[:32].hex()}")
 
             # Detect protocol
             if MTProtoFrame.is_mtproto(initial, self.config.secret):
@@ -292,6 +307,8 @@ class ConnectionHandler:
             writer.close()
         except Exception as e:
             logger.error(f"[-] Error: {e}")
+            import traceback
+            traceback.print_exc()
             writer.close()
 
     async def _handle_socks5(self, reader, writer, initial: bytes):

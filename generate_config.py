@@ -11,8 +11,12 @@ import secrets
 
 
 def generate_secret() -> str:
-    """Generate a random 32-byte secret for MTProto."""
-    return secrets.token_hex(32)
+    """Generate a random 32-byte secret for MTProto with dd prefix."""
+    # MTProto secrets should start with dd or ee for proper detection
+    # dd = secure MTProto, ee = fake TLS mode
+    prefix = "dd"
+    remaining = secrets.token_hex(31)  # 31 bytes = 62 hex chars
+    return prefix + remaining
 
 
 def generate_config(output_file: str = "config.json") -> dict:

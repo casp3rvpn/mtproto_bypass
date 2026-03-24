@@ -313,29 +313,29 @@ class ConnectionHandler:
 
     async def _handle_socks5(self, reader, writer, initial: bytes):
         """Handle SOCKS5 connection - proxy to Telegram."""
+        peer = writer.get_extra_info('peername')
+        logger.info(f"[SOCKS5] Starting SOCKS5 handshake with {peer[0]}")
+        
         try:
             # SOCKS5 handshake: client sends version(0x05), nmethods, methods
-            # We respond with: version(0x05), method(0x00 = no auth)
             if len(initial) >= 3 and initial[0] == 0x05:
-                nmethods = initial[1]
                 # Respond with no authentication required
                 writer.write(b'\x05\x00')
                 await writer.drain()
-                logger.info("[SOCKS5] Sent auth response")
+                logger.info("[SOCKS5] Sent auth response (0x05 0x00)")
 
                 # Read SOCKS5 request
-                request = await asyncio.wait_for(reader.read(262), timeout=5.0)
+                request = await asyncio.wait_for(reader.read(262), timeout=10.0)
                 if not request or len(request) < 10:
-                    logger.info("[SOCKS5] No request received")
+                    logger.info(f"[SOCKS5] Invalid request: {request}")
                     writer.close()
                     return
 
-                # Parse request: version, cmd, rsv, atype, dst.addr, dst.port
+                # Parse request
                 cmd = request[1]
                 atype = request[3]
-
-                # Determine destination
                 offset = 4
+                
                 if atype == 1:  # IPv4
                     dst_ip = '.'.join(str(b) for b in request[offset:offset+4])
                     offset += 4
@@ -347,71 +347,84 @@ class ConnectionHandler:
                     dst_ip = ':'.join(hex(b)[2:] for b in request[offset:offset+16])
                     offset += 16
                 else:
+                    logger.error(f"[SOCKS5] Unknown address type: {atype}")
                     writer.close()
                     return
 
                 dst_port = struct.unpack('>H', request[offset:offset+2])[0]
-
                 logger.info(f"[SOCKS5] Request: cmd={cmd} addr={dst_ip}:{dst_port}")
 
-                # For MTProto proxy, ignore requested destination and connect to Telegram
-                # Telegram clients often use dummy addresses with SOCKS5
-                logger.info(f"[SOCKS5] Redirecting to Telegram {self.config.telegram_host}:{self.config.telegram_port}")
-                
-                # Send success response with dummy address
+                # Send success response
                 response = b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00'
                 writer.write(response)
                 await writer.drain()
+                logger.info("[SOCKS5] Sent success response")
 
                 # Connect to Telegram
-                try:
-                    tg_reader, tg_writer = await asyncio.wait_for(
-                        asyncio.open_connection(self.config.telegram_host, self.config.telegram_port),
-                        timeout=5.0
-                    )
-                    logger.info(f"[SOCKS5] Connected to Telegram")
+                tg_reader, tg_writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.config.telegram_host, self.config.telegram_port),
+                    timeout=10.0
+                )
+                logger.info(f"[SOCKS5] Connected to Telegram {self.config.telegram_host}:{self.config.telegram_port}")
 
-                    async def c2t():
+                # Forward any remaining initial data to Telegram
+                # (after SOCKS5 request was parsed)
+                remaining = await reader.read(4096)
+                if remaining:
+                    logger.info(f"[SOCKS5] Forwarding {len(remaining)} bytes initial data to Telegram")
+                    tg_writer.write(remaining)
+                    await tg_writer.drain()
+
+                # Proxy bidirectionally
+                async def client_to_telegram():
+                    try:
+                        while True:
+                            data = await reader.read(4096)
+                            if not data:
+                                logger.info("[SOCKS5] Client closed connection")
+                                break
+                            tg_writer.write(data)
+                            await tg_writer.drain()
+                    except Exception as e:
+                        logger.debug(f"[SOCKS5] C->T error: {type(e).__name__}: {e}")
+                    finally:
                         try:
-                            while True:
-                                data = await reader.read(4096)
-                                if not data:
-                                    break
-                                tg_writer.write(data)
-                                await tg_writer.drain()
-                        except Exception as e:
-                            logger.debug(f"[SOCKS5] C->T closed: {type(e).__name__}")
-                        finally:
-                            try:
-                                tg_writer.close()
-                            except Exception:
-                                pass
+                            tg_writer.close()
+                        except Exception:
+                            pass
 
-                    async def t2c():
+                async def telegram_to_client():
+                    try:
+                        while True:
+                            data = await tg_reader.read(4096)
+                            if not data:
+                                logger.info("[SOCKS5] Telegram closed connection")
+                                break
+                            writer.write(data)
+                            await writer.drain()
+                    except Exception as e:
+                        logger.debug(f"[SOCKS5] T->C error: {type(e).__name__}: {e}")
+                    finally:
                         try:
-                            while True:
-                                data = await tg_reader.read(4096)
-                                if not data:
-                                    break
-                                writer.write(data)
-                                await writer.drain()
-                        except Exception as e:
-                            logger.debug(f"[SOCKS5] T->C closed: {type(e).__name__}")
-                        finally:
-                            try:
-                                writer.close()
-                            except Exception:
-                                pass
+                            writer.close()
+                        except Exception:
+                            pass
 
-                    await asyncio.gather(c2t(), t2c(), return_exceptions=True)
-                    logger.info("[-] SOCKS5 session ended")
+                # Run both directions
+                await asyncio.gather(
+                    client_to_telegram(),
+                    telegram_to_client(),
+                    return_exceptions=True
+                )
+                logger.info("[-] SOCKS5 session ended")
 
-                except Exception as e:
-                    logger.error(f"[SOCKS5] Telegram connection failed: {e}")
-                    writer.close()
-
+        except asyncio.TimeoutError as e:
+            logger.error(f"[SOCKS5] Timeout: {e}")
+            writer.close()
         except Exception as e:
             logger.error(f"[SOCKS5] Error: {e}")
+            import traceback
+            traceback.print_exc()
             writer.close()
 
     async def _handle_mtproto(self, reader, writer, initial: bytes):

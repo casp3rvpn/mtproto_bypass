@@ -771,19 +771,63 @@ class MTProtoProxyServer:
 # Entry Point
 # =============================================================================
 
+def load_config_from_file(config_path: str = "config.json") -> Optional[dict]:
+    """Load configuration from JSON file."""
+    import json
+    
+    if not os.path.exists(config_path):
+        print(f"[-] Config file {config_path} not found, using defaults")
+        return None
+    
+    try:
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[-] Error loading config: {e}")
+        return None
+
 async def main():
     """Main entry point."""
-    secret = os.urandom(32)
-
-    config = ProxyConfig(
-        host="0.0.0.0",
-        port=443,
-        secret=secret,
-        tls_cert="cert.pem",
-        tls_key="key.pem",
-        real_website_host="ya.ru",
-        fake_domain="ya.ru",
-    )
+    import json
+    
+    # Load configuration from file
+    file_config = load_config_from_file("config.json")
+    
+    if file_config:
+        # Use config from file
+        proxy_cfg = file_config.get('proxy', {})
+        tls_cfg = file_config.get('tls', {})
+        telegram_cfg = file_config.get('telegram', {})
+        dpi_cfg = file_config.get('dpi_bypass', {})
+        
+        secret = bytes.fromhex(proxy_cfg.get('secret', os.urandom(32).hex()))
+        
+        config = ProxyConfig(
+            host=proxy_cfg.get('host', '0.0.0.0'),
+            port=proxy_cfg.get('port', 443),
+            secret=secret,
+            tls_cert=tls_cfg.get('cert_path', 'cert.pem'),
+            tls_key=tls_cfg.get('key_path', 'key.pem'),
+            real_website_host=dpi_cfg.get('real_website_host', 'ya.ru'),
+            fake_domain=dpi_cfg.get('fake_domain', 'ya.ru'),
+            telegram_host=telegram_cfg.get('host', '149.154.167.50'),
+            telegram_port=telegram_cfg.get('port', 443),
+            dpi_timeout=dpi_cfg.get('timeout', 2.0),
+        )
+        print(f"[✓] Loaded configuration from config.json")
+    else:
+        # Use defaults
+        secret = os.urandom(32)
+        config = ProxyConfig(
+            host="0.0.0.0",
+            port=443,
+            secret=secret,
+            tls_cert="cert.pem",
+            tls_key="key.pem",
+            real_website_host="ya.ru",
+            fake_domain="ya.ru",
+        )
+        print(f"[✓] Using default configuration")
 
     server = MTProtoProxyServer(config)
 

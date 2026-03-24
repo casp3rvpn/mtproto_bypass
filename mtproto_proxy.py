@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-MTProto Proxy Server with Real Website DPI Bypass
-==================================================
-Supports:
-- Plain MTProto connections (for Telegram clients)
-- TLS/HTTPS connections (for browsers/DPI - serves real website)
+MTProto Proxy Server with DPI Bypass (Single Port)
+===================================================
+Accepts both MTProto and HTTPS on the same port (443).
+- MTProto clients (secret starting with ee) -> Telegram
+- HTTPS/Browser -> Real website (ya.ru, etc.)
 """
 
 import asyncio
 import hashlib
 import logging
 import os
-import socket
 import ssl
 import struct
-import re
 import sys
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
@@ -36,10 +34,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ProxyConfig:
-    """Proxy server configuration."""
     host: str = "0.0.0.0"
     port: int = 443
-    mtproto_port: int = 3128  # Separate port for plain MTProto
     secret: bytes = None
     tls_cert: str = "cert.pem"
     tls_key: str = "key.pem"
@@ -59,13 +55,12 @@ class ProxyConfig:
 # =============================================================================
 
 class MTProtoFrame:
-    """MTProto frame handling."""
     HEADER_SIZE = 8
-    MAGIC_BYTE = 0xee
+    MAGIC_BYTE = 0xee  # Obfuscated MTProto
 
     @classmethod
     def is_mtproto(cls, data: bytes, secret: bytes) -> bool:
-        """Check if data is MTProto."""
+        """Check if data is MTProto by XORing header with secret."""
         if len(data) < 8:
             return False
         test_header = bytearray(data[:8])
@@ -73,21 +68,24 @@ class MTProtoFrame:
             test_header[i] ^= secret[i % len(secret)]
         return test_header[0] == cls.MAGIC_BYTE
 
+    @classmethod
+    def decode_length(cls, data: bytes, secret: bytes) -> int:
+        """Decode frame length from header."""
+        header = bytearray(data[:8])
+        for i in range(8):
+            header[i] ^= secret[i % len(secret)]
+        return struct.unpack('<I', bytes(header[1:5]))[0]
+
 
 # =============================================================================
 # HTTP Handler
 # =============================================================================
 
 class HTTPHandler:
-    """Handles HTTP requests."""
-
     @staticmethod
     def is_http(data: bytes) -> bool:
-        """Check if data is HTTP request."""
-        try:
-            return data.startswith((b'GET ', b'POST ', b'HEAD ', b'PUT ', b'DELETE ', b'OPTIONS '))
-        except Exception:
-            return False
+        """Check if data starts with HTTP method."""
+        return data.startswith((b'GET ', b'POST ', b'HEAD ', b'PUT ', b'DELETE ', b'OPTIONS '))
 
     @staticmethod
     def parse(data: bytes) -> Tuple[str, str, dict]:
@@ -113,8 +111,6 @@ class HTTPHandler:
 # =============================================================================
 
 class RealWebsiteProxy:
-    """Proxies to real website."""
-
     WEBSITES = [
         ("ya.ru", 443),
         ("mail.ru", 443),
@@ -123,17 +119,17 @@ class RealWebsiteProxy:
         ("mamba.ru", 443),
     ]
 
-    async def fetch(self, path: str) -> Tuple[int, dict, bytes]:
+    async def fetch(self, path: str, host_header: str = None) -> Tuple[int, dict, bytes]:
         """Fetch from real website."""
         for host, port in self.WEBSITES:
             try:
-                return await self._fetch_from(host, port, path)
+                return await self._fetch_from(host, port, path, host_header or host)
             except Exception as e:
                 logger.debug(f"Failed to fetch from {host}: {e}")
                 continue
         return 502, {}, b"<h1>502 Bad Gateway</h1>"
 
-    async def _fetch_from(self, host: str, port: int, path: str) -> Tuple[int, dict, bytes]:
+    async def _fetch_from(self, host: str, port: int, path: str, host_header: str) -> Tuple[int, dict, bytes]:
         """Fetch from specific host."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -146,7 +142,7 @@ class RealWebsiteProxy:
 
         request = (
             f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
+            f"Host: {host_header}\r\n"
             f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0\r\n"
             f"Accept: text/html,application/xhtml+xml\r\n"
             f"Accept-Language: ru-RU,ru;q=0.9\r\n"
@@ -160,7 +156,6 @@ class RealWebsiteProxy:
         response = await asyncio.wait_for(reader.read(65536), timeout=10.0)
         writer.close()
 
-        # Parse response
         if b'\r\n\r\n' in response:
             header_part, body = response.split(b'\r\n\r\n', 1)
         else:
@@ -169,6 +164,7 @@ class RealWebsiteProxy:
         lines = header_part.decode('utf-8', errors='ignore').split('\r\n')
         status = 200
         if lines:
+            import re
             match = re.match(r'HTTP/[\d.]+ (\d+)', lines[0])
             if match:
                 status = int(match.group(1))
@@ -177,44 +173,112 @@ class RealWebsiteProxy:
 
 
 # =============================================================================
-# Connection Handlers
+# TLS Handler - proxies full TLS connection to real website
 # =============================================================================
 
-class PlainConnectionHandler:
-    """Handles plain (non-TLS) connections - MTProto from Telegram."""
+class TLSProxy:
+    """Proxies raw TLS connection to real website."""
+
+    WEBSITES = [
+        ("ya.ru", 443),
+        ("mail.ru", 443),
+        ("www.yandex.ru", 443),
+        ("vk.com", 443),
+        ("mamba.ru", 443),
+    ]
+
+    async def proxy(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
+        """Proxy TLS connection to real website."""
+        for host, port in self.WEBSITES:
+            try:
+                await self._proxy_to(host, port, client_reader, client_writer)
+                return
+            except Exception as e:
+                logger.debug(f"TLS proxy to {host} failed: {e}")
+                continue
+        logger.error("All TLS proxy targets failed")
+        client_writer.close()
+
+    async def _proxy_to(self, host: str, port: int, client_reader, client_writer):
+        """Proxy to specific host."""
+        upstream_reader, upstream_writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=5.0
+        )
+
+        async def forward(src, dst, name):
+            try:
+                while True:
+                    data = await src.read(4096)
+                    if not data:
+                        break
+                    dst.write(data)
+                    await dst.drain()
+            except Exception as e:
+                logger.debug(f"{name} closed: {type(e).__name__}")
+            finally:
+                try:
+                    dst.close()
+                except Exception:
+                    pass
+
+        await asyncio.gather(
+            forward(client_reader, upstream_writer, "client->upstream"),
+            forward(upstream_reader, client_writer, "upstream->client"),
+            return_exceptions=True
+        )
+
+
+# =============================================================================
+# Main Connection Handler
+# =============================================================================
+
+class ConnectionHandler:
+    """Handles all connections - detects protocol and routes."""
 
     def __init__(self, config: ProxyConfig):
         self.config = config
+        self.website = RealWebsiteProxy()
+        self.tls_proxy = TLSProxy()
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Handle plain connection."""
+        """Main handler - detect protocol from first bytes."""
         peer = writer.get_extra_info('peername')
-        logger.info(f"[+] Plain connection from {peer[0]}:{peer[1]}")
+        logger.info(f"[+] Connection from {peer[0]}:{peer[1]}")
 
         try:
-            data = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-            if not data:
+            # Read first bytes to detect protocol
+            initial = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+            if not initial:
                 writer.close()
                 return
 
-            logger.info(f"[Data] Received {len(data)} bytes: {data[:20].hex()}")
+            logger.info(f"[Data] First bytes: {initial[:20].hex()}")
 
-            if MTProtoFrame.is_mtproto(data, self.config.secret):
-                logger.info("[MTProto] MTProto detected - connecting to Telegram")
-                await self._proxy_to_telegram(reader, writer, data)
+            # Detect protocol
+            if MTProtoFrame.is_mtproto(initial, self.config.secret):
+                logger.info("[MTProto] MTProto detected - proxying to Telegram")
+                await self._handle_mtproto(reader, writer, initial)
+            elif initial[0] == 0x16:  # TLS handshake
+                logger.info("[TLS] TLS handshake detected - proxying to real website")
+                # Send initial data to upstream and proxy
+                await self._handle_tls(reader, writer, initial)
+            elif HTTPHandler.is_http(initial):
+                logger.info("[HTTP] HTTP request - serving website")
+                await self._handle_http(reader, writer, initial)
             else:
-                logger.info("[Unknown] Unknown protocol - closing")
+                logger.info(f"[Unknown] Unknown protocol (first byte: {hex(initial[0])}) - closing")
                 writer.close()
 
         except asyncio.TimeoutError:
-            logger.error("[-] Timeout reading data")
+            logger.error("[-] Connection timeout")
             writer.close()
         except Exception as e:
             logger.error(f"[-] Error: {e}")
             writer.close()
 
-    async def _proxy_to_telegram(self, reader, writer, initial_data: bytes):
-        """Proxy to Telegram."""
+    async def _handle_mtproto(self, reader, writer, initial: bytes):
+        """Handle MTProto connection."""
         try:
             tg_reader, tg_writer = await asyncio.open_connection(
                 self.config.telegram_host,
@@ -222,7 +286,7 @@ class PlainConnectionHandler:
             )
             logger.info(f"[✓] Connected to Telegram {self.config.telegram_host}:{self.config.telegram_port}")
 
-            tg_writer.write(initial_data)
+            tg_writer.write(initial)
             await tg_writer.drain()
 
             async def c2t():
@@ -234,7 +298,7 @@ class PlainConnectionHandler:
                         tg_writer.write(data)
                         await tg_writer.drain()
                 except Exception as e:
-                    logger.debug(f"C->T closed: {type(e).__name__}")
+                    logger.debug(f"C->T: {type(e).__name__}")
 
             async def t2c():
                 try:
@@ -245,7 +309,7 @@ class PlainConnectionHandler:
                         writer.write(data)
                         await writer.drain()
                 except Exception as e:
-                    logger.debug(f"T->C closed: {type(e).__name__}")
+                    logger.debug(f"T->C: {type(e).__name__}")
 
             await asyncio.gather(c2t(), t2c(), return_exceptions=True)
             logger.info("[-] MTProto session ended")
@@ -255,51 +319,91 @@ class PlainConnectionHandler:
         finally:
             writer.close()
 
-
-class TLSConnectionHandler:
-    """Handles TLS connections - browsers/DPI."""
-
-    def __init__(self, config: ProxyConfig, ssl_context: ssl.SSLContext):
-        self.config = config
-        self.ssl_context = ssl_context
-        self.website = RealWebsiteProxy()
-
-    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Handle TLS connection."""
-        peer = writer.get_extra_info('peername')
-        logger.info(f"[+] TLS connection from {peer[0]}:{peer[1]}")
-
+    async def _handle_tls(self, reader, writer, initial: bytes):
+        """Handle TLS connection by proxying to real website."""
         try:
-            # TLS handshake is automatic with asyncio.start_server(ssl=...)
-            # Data is already decrypted
-            data = await asyncio.wait_for(reader.read(65536), timeout=5.0)
-            if not data:
-                writer.close()
-                return
+            # Connect to real website
+            for host, port in self.tls_proxy.WEBSITES:
+                try:
+                    upstream_reader, upstream_writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port),
+                        timeout=5.0
+                    )
+                    logger.info(f"[TLS] Connected to {host}:{port}")
 
-            logger.info(f"[TLS Data] Received {len(data)} bytes")
+                    # Send initial TLS ClientHello to upstream
+                    upstream_writer.write(initial)
+                    await upstream_writer.drain()
 
-            if HTTPHandler.is_http(data):
-                method, path, headers = HTTPHandler.parse(data)
-                logger.info(f"[HTTP] {method} {path}")
+                    # Proxy bidirectionally
+                    async def c2u():
+                        try:
+                            while True:
+                                data = await reader.read(4096)
+                                if not data:
+                                    break
+                                upstream_writer.write(data)
+                                await upstream_writer.drain()
+                        except Exception:
+                            pass
+                        finally:
+                            try:
+                                upstream_writer.close()
+                            except Exception:
+                                pass
 
-                status, resp_headers, body = await self.website.fetch(path)
-                logger.info(f"[HTTP] Response: {status} body_len={len(body)}")
+                    async def u2c():
+                        try:
+                            while True:
+                                data = await upstream_reader.read(4096)
+                                if not data:
+                                    break
+                                writer.write(data)
+                                await writer.drain()
+                        except Exception:
+                            pass
+                        finally:
+                            try:
+                                writer.close()
+                            except Exception:
+                                pass
 
-                response = f"HTTP/1.1 {status} OK\r\n"
-                for k, v in resp_headers.items():
-                    response += f"{k}: {v}\r\n"
-                response += "\r\n"
+                    await asyncio.gather(c2u(), u2c(), return_exceptions=True)
+                    logger.info("[-] TLS session ended")
+                    return
 
-                writer.write(response.encode())
-                writer.write(body)
-                await writer.drain()
-                logger.info("[HTTP] Response sent")
-            else:
-                logger.info("[TLS] Unknown TLS data - closing")
+                except Exception as e:
+                    logger.debug(f"TLS proxy to {host} failed: {e}")
+                    continue
+
+            logger.error("[-] All TLS proxy targets failed")
+            writer.close()
 
         except Exception as e:
             logger.error(f"[-] TLS error: {e}")
+            writer.close()
+
+    async def _handle_http(self, reader, writer, initial: bytes):
+        """Handle HTTP request (after TLS termination or plain)."""
+        try:
+            method, path, headers = HTTPHandler.parse(initial)
+            logger.info(f"[HTTP] {method} {path}")
+
+            status, resp_headers, body = await self.website.fetch(path, headers.get('host'))
+            logger.info(f"[HTTP] Response: {status} body_len={len(body)}")
+
+            response = f"HTTP/1.1 {status} OK\r\n"
+            for k, v in resp_headers.items():
+                response += f"{k}: {v}\r\n"
+            response += "\r\n"
+
+            writer.write(response.encode())
+            writer.write(body)
+            await writer.drain()
+            logger.info("[HTTP] Response sent")
+
+        except Exception as e:
+            logger.error(f"[-] HTTP error: {e}")
         finally:
             try:
                 writer.close()
@@ -309,15 +413,12 @@ class TLSConnectionHandler:
 
 
 # =============================================================================
-# TLS Context
+# TLS Context (for reference, not used in raw mode)
 # =============================================================================
 
 class TLSContextManager:
-    """Manages TLS context."""
-
     @staticmethod
     def create(cert_path: str, key_path: str) -> ssl.SSLContext:
-        """Create SSL context."""
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(cert_path, key_path)
@@ -326,7 +427,6 @@ class TLSContextManager:
 
     @staticmethod
     def generate(cert_path: str, key_path: str, domain: str = "ya.ru"):
-        """Generate self-signed cert."""
         from cryptography import x509
         from cryptography.x509.oid import NameOID
         from cryptography.hazmat.primitives import hashes, serialization
@@ -377,21 +477,16 @@ class TLSContextManager:
 # =============================================================================
 
 class MTProtoProxyServer:
-    """MTProto proxy with separate ports for plain and TLS."""
-
     def __init__(self, config: ProxyConfig):
         self.config = config
-        self.plain_handler = PlainConnectionHandler(config)
-        self.tls_context = TLSContextManager.create(config.tls_cert, config.tls_key)
-        self.tls_handler = TLSConnectionHandler(config, self.tls_context)
+        self.handler = ConnectionHandler(config)
 
     async def start(self):
-        """Start both plain and TLS servers."""
+        """Start proxy server on single port."""
         logger.info("=" * 60)
-        logger.info("MTProto Proxy with DPI Bypass")
+        logger.info("MTProto Proxy with DPI Bypass (Single Port)")
         logger.info("=" * 60)
-        logger.info(f"Plain MTProto port: {self.config.mtproto_port}")
-        logger.info(f"TLS/HTTPS port: {self.config.port}")
+        logger.info(f"Listening on: {self.config.host}:{self.config.port}")
         logger.info(f"Secret: {self.config.secret.hex()}")
         logger.info(f"Telegram: {self.config.telegram_host}:{self.config.telegram_port}")
         logger.info("=" * 60)
@@ -400,32 +495,22 @@ class MTProtoProxyServer:
         if not os.path.exists(self.config.tls_cert):
             TLSContextManager.generate(self.config.tls_cert, self.config.tls_key, self.config.fake_domain)
 
-        # Start plain server (for Telegram MTProto)
-        plain_server = await asyncio.start_server(
-            self.plain_handler.handle,
-            self.config.host,
-            self.config.mtproto_port,
-            reuse_port=True
-        )
-
-        # Start TLS server (for browsers/DPI)
-        tls_server = await asyncio.start_server(
-            self.tls_handler.handle,
+        # Start server WITHOUT SSL - we handle raw TCP
+        server = await asyncio.start_server(
+            self.handler.handle,
             self.config.host,
             self.config.port,
-            ssl=self.tls_context,
             reuse_port=True
         )
 
-        logger.info(f"[✓] Plain server on {self.config.host}:{self.config.mtproto_port}")
-        logger.info(f"[✓] TLS server on {self.config.host}:{self.config.port}")
+        addr = server.sockets[0].getsockname()
+        logger.info(f"[✓] Server running on {addr[0]}:{addr[1]}")
+        logger.info(f"[✓] MTProto clients -> Telegram")
+        logger.info(f"[✓] Browser/DPI -> Real website")
         logger.info("=" * 60)
 
-        async with plain_server, tls_server:
-            await asyncio.gather(
-                plain_server.serve_forever(),
-                tls_server.serve_forever()
-            )
+        async with server:
+            await server.serve_forever()
 
 
 # =============================================================================
@@ -433,7 +518,6 @@ class MTProtoProxyServer:
 # =============================================================================
 
 def load_config(path: str = "config.json") -> Optional[dict]:
-    """Load config from file."""
     import json
     if not os.path.exists(path):
         return None
@@ -446,7 +530,6 @@ def load_config(path: str = "config.json") -> Optional[dict]:
 
 
 async def main():
-    """Main entry point."""
     cfg = load_config()
 
     if cfg:
@@ -458,7 +541,6 @@ async def main():
         config = ProxyConfig(
             host=proxy.get('host', '0.0.0.0'),
             port=proxy.get('port', 443),
-            mtproto_port=proxy.get('mtproto_port', 3128),
             secret=bytes.fromhex(proxy.get('secret', os.urandom(32).hex())),
             tls_cert=tls.get('cert_path', 'cert.pem'),
             tls_key=tls.get('key_path', 'key.pem'),
@@ -483,4 +565,4 @@ if __name__ == "__main__":
         logger.info("\n[!] Shutting down...")
     except PermissionError as e:
         logger.error(f"[!] Permission error: {e}")
-        logger.error("Run with sudo or set capabilities: sudo setcap 'cap_net_bind_service=+ep' $(which python3)")
+        logger.error("Run with sudo or: sudo setcap 'cap_net_bind_service=+ep' $(which python3)")

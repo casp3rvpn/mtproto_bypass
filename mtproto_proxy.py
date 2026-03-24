@@ -560,20 +560,20 @@ class TLSContextManager:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.maximum_version = ssl.TLSVersion.TLSv1_3
-        
+
         context.load_cert_chain(cert_path, key_path)
         context.set_ciphers(
             'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20'
         )
-        
+
+        # OP_NO_SSLv2 and OP_NO_SSLv3 are set by default in Python 3.10+
+        # TLS 1.0/1.1 are disabled via minimum_version=TLSv1_2
         context.options |= ssl.OP_NO_SSLv2
         context.options |= ssl.OP_NO_SSLv3
-        context.options |= ssl.OP_NO_TLSv1
-        context.options |= ssl.OP_NO_TLSv1_1
-        
+
         # Enable SNI
         context.sni_callback = TLSContextManager._sni_callback
-        
+
         return context
     
     @staticmethod
@@ -605,6 +605,7 @@ class TLSContextManager:
             x509.NameAttribute(NameOID.COMMON_NAME, domain),
         ])
         
+        now = datetime.datetime.now(datetime.timezone.utc)
         cert = x509.CertificateBuilder().subject_name(
             subject
         ).issuer_name(
@@ -614,9 +615,9 @@ class TLSContextManager:
         ).serial_number(
             x509.random_serial_number()
         ).not_valid_before(
-            datetime.datetime.utcnow()
+            now
         ).not_valid_after(
-            datetime.datetime.utcnow() + datetime.timedelta(days=365)
+            now + datetime.timedelta(days=365)
         ).add_extension(
             x509.SubjectAlternativeName([
                 x509.DNSName(domain),

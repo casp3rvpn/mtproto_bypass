@@ -16,15 +16,25 @@ Features:
 
 import asyncio
 import hashlib
+import logging
 import os
 import socket
 import ssl
 import struct
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, List
 
 import pyaes
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Configuration
@@ -397,55 +407,34 @@ class ConnectionHandler:
 
     async def handle_connection(self, reader: asyncio.StreamReader,
                                  writer: asyncio.StreamWriter) -> None:
-        """Main connection handler - accept TLS then detect protocol."""
+        """Main connection handler - TLS already handled by asyncio.start_server."""
         peer_addr = writer.get_extra_info('peername')
-        print(f"[+] Connection from {peer_addr[0]}:{peer_addr[1]}")
+        logger.info(f"[+] Connection from {peer_addr[0]}:{peer_addr[1]}")
 
         try:
-            # Read ClientHello to check SNI
+            # Read decrypted data (TLS already handled by asyncio.start_server)
             initial_data = await asyncio.wait_for(reader.read(65536), timeout=5.0)
             if not initial_data:
+                logger.info("[-] No initial data received")
                 writer.close()
                 return
 
-            # Check if this is a TLS handshake
-            if initial_data[0] == 0x16:  # TLS record
-                sni_host = SNIParser.parse_sni(initial_data)
-                print(f"[TLS] ClientHello received, SNI: {sni_host or 'none'}")
+            logger.info(f"[Data] Received {len(initial_data)} bytes: {initial_data[:20].hex()}")
 
-                # Perform TLS handshake
-                ssl_context = self.get_ssl_context()
-                try:
-                    ssl_reader, ssl_writer = await asyncio.wait_for(
-                        asyncio.start_tls(
-                            reader, writer, ssl_context,
-                            server_side=True,
-                            ssl_handshake_timeout=5.0
-                        ),
-                        timeout=10.0
-                    )
-                    print(f"[TLS] Handshake completed")
-
-                    # Now read decrypted data to detect protocol
-                    await self._handle_decrypted_connection(ssl_reader, ssl_writer)
-
-                except ssl.SSLError as e:
-                    print(f"[-] TLS handshake error: {e}")
-                    # On TLS error, serve website (DPI bypass)
-                    await self.website_proxy.proxy_full_connection(reader, writer)
-                except asyncio.TimeoutError:
-                    print(f"[-] TLS handshake timeout")
-                    writer.close()
-                except Exception as e:
-                    print(f"[-] TLS error: {e}")
-                    writer.close()
+            # Detect protocol from decrypted data
+            if self._is_mtproto(initial_data):
+                logger.info("[MTProto] MTProto detected")
+                await self._handle_mtproto_with_data(reader, writer, initial_data)
+            elif HTTPHandler.is_http_request(initial_data):
+                logger.info("[Web] HTTP request - serving website")
+                await self._handle_http_request_decrypted(reader, writer, initial_data)
             else:
-                # Not TLS - could be HTTP or raw MTProto (unlikely on 443)
-                print(f"[Web] Non-TLS connection - serving website")
-                await self.website_proxy.proxy_full_connection(reader, writer)
+                # Unknown protocol - default to MTProto for Telegram clients
+                logger.info("[MTProto] Unknown protocol - assuming MTProto")
+                await self._handle_mtproto_with_data(reader, writer, initial_data)
 
         except asyncio.TimeoutError:
-            print(f"[-] Connection timeout")
+            logger.error("[-] Connection timeout")
             try:
                 writer.close()
             except Exception:
@@ -453,7 +442,7 @@ class ConnectionHandler:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"[-] Error: {e}")
+            logger.error(f"[-] Error: {e}")
             try:
                 writer.close()
             except Exception:
@@ -466,30 +455,30 @@ class ConnectionHandler:
             # Read first bytes of decrypted data
             decrypted_data = await asyncio.wait_for(reader.read(4096), timeout=5.0)
             if not decrypted_data:
+                logger.info("[-] No decrypted data received")
                 writer.close()
                 return
 
             # Detect protocol from decrypted data
             if self._is_mtproto(decrypted_data):
-                print(f"[MTProto] MTProto detected in decrypted stream")
-                # Send remaining data to Telegram
+                logger.info("[MTProto] MTProto detected in decrypted stream")
                 await self._handle_mtproto_with_data(reader, writer, decrypted_data)
             elif HTTPHandler.is_http_request(decrypted_data):
-                print(f"[Web] HTTP request after TLS - serving website")
+                logger.info("[Web] HTTP request after TLS - serving website")
                 await self._handle_http_request_decrypted(reader, writer, decrypted_data)
             else:
                 # Unknown protocol after TLS - default to MTProto for Telegram clients
-                print(f"[MTProto] Unknown protocol after TLS - assuming MTProto")
+                logger.info("[MTProto] Unknown protocol after TLS - assuming MTProto")
                 await self._handle_mtproto_with_data(reader, writer, decrypted_data)
 
         except asyncio.TimeoutError:
-            print(f"[-] Decrypted read timeout")
+            logger.error("[-] Decrypted read timeout")
             try:
                 writer.close()
             except Exception:
                 pass
         except Exception as e:
-            print(f"[-] Decrypted connection error: {e}")
+            logger.error(f"[-] Decrypted connection error: {e}")
             try:
                 writer.close()
             except Exception:
@@ -506,7 +495,7 @@ class ConnectionHandler:
 
         is_mtproto = test_header[0] == 0xee
         if is_mtproto:
-            print(f"[MTProto] Header check passed (magic=0xee)")
+            logger.info("[MTProto] Header check passed (magic=0xee)")
         return is_mtproto
 
     async def _handle_http_request_decrypted(self, reader: asyncio.StreamReader,
@@ -515,14 +504,7 @@ class ConnectionHandler:
         """Handle HTTP request inside TLS."""
         try:
             method, path, headers = HTTPHandler.parse_request(initial_data)
-
-            # Read more data if needed
-            content_length = headers.get('content-length', '0')
-            if content_length:
-                remaining = int(content_length) - len(initial_data)
-                if remaining > 0:
-                    more_data = await reader.read(remaining)
-                    initial_data += more_data
+            logger.info(f"[HTTP] {method} {path} headers={list(headers.keys())}")
 
             # Fetch from real website
             status, resp_headers, body = await self.website_proxy.fetch_website(
@@ -530,6 +512,7 @@ class ConnectionHandler:
                 path,
                 headers
             )
+            logger.info(f"[HTTP] Response: {status} body_len={len(body)}")
 
             # Build HTTP response
             response = f"HTTP/1.1 {status} OK\r\n"
@@ -540,12 +523,14 @@ class ConnectionHandler:
             writer.write(response.encode('utf-8'))
             writer.write(body)
             await writer.drain()
+            logger.info("[HTTP] Response sent")
 
         except Exception as e:
-            print(f"[-] HTTP error: {e}")
+            logger.error(f"[-] HTTP error: {e}")
         finally:
             try:
                 writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
 

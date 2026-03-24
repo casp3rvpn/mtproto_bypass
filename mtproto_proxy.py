@@ -312,7 +312,7 @@ class ConnectionHandler:
             writer.close()
 
     async def _handle_socks5(self, reader, writer, initial: bytes):
-        """Handle SOCKS5 connection."""
+        """Handle SOCKS5 connection - proxy to Telegram."""
         try:
             # SOCKS5 handshake: client sends version(0x05), nmethods, methods
             # We respond with: version(0x05), method(0x00 = no auth)
@@ -321,10 +321,12 @@ class ConnectionHandler:
                 # Respond with no authentication required
                 writer.write(b'\x05\x00')
                 await writer.drain()
+                logger.info("[SOCKS5] Sent auth response")
 
                 # Read SOCKS5 request
                 request = await asyncio.wait_for(reader.read(262), timeout=5.0)
                 if not request or len(request) < 10:
+                    logger.info("[SOCKS5] No request received")
                     writer.close()
                     return
 
@@ -352,56 +354,60 @@ class ConnectionHandler:
 
                 logger.info(f"[SOCKS5] Request: cmd={cmd} addr={dst_ip}:{dst_port}")
 
-                # Send success response
+                # For MTProto proxy, ignore requested destination and connect to Telegram
+                # Telegram clients often use dummy addresses with SOCKS5
+                logger.info(f"[SOCKS5] Redirecting to Telegram {self.config.telegram_host}:{self.config.telegram_port}")
+                
+                # Send success response with dummy address
                 response = b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00'
                 writer.write(response)
                 await writer.drain()
 
-                # Connect to destination
+                # Connect to Telegram
                 try:
-                    upstream_reader, upstream_writer = await asyncio.wait_for(
-                        asyncio.open_connection(dst_ip, dst_port),
+                    tg_reader, tg_writer = await asyncio.wait_for(
+                        asyncio.open_connection(self.config.telegram_host, self.config.telegram_port),
                         timeout=5.0
                     )
-                    logger.info(f"[SOCKS5] Connected to {dst_ip}:{dst_port}")
+                    logger.info(f"[SOCKS5] Connected to Telegram")
 
-                    async def c2u():
+                    async def c2t():
                         try:
                             while True:
                                 data = await reader.read(4096)
                                 if not data:
                                     break
-                                upstream_writer.write(data)
-                                await upstream_writer.drain()
-                        except Exception:
-                            pass
+                                tg_writer.write(data)
+                                await tg_writer.drain()
+                        except Exception as e:
+                            logger.debug(f"[SOCKS5] C->T closed: {type(e).__name__}")
                         finally:
                             try:
-                                upstream_writer.close()
+                                tg_writer.close()
                             except Exception:
                                 pass
 
-                    async def u2c():
+                    async def t2c():
                         try:
                             while True:
-                                data = await upstream_reader.read(4096)
+                                data = await tg_reader.read(4096)
                                 if not data:
                                     break
                                 writer.write(data)
                                 await writer.drain()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[SOCKS5] T->C closed: {type(e).__name__}")
                         finally:
                             try:
                                 writer.close()
                             except Exception:
                                 pass
 
-                    await asyncio.gather(c2u(), u2c(), return_exceptions=True)
+                    await asyncio.gather(c2t(), t2c(), return_exceptions=True)
                     logger.info("[-] SOCKS5 session ended")
 
                 except Exception as e:
-                    logger.error(f"[SOCKS5] Connection failed: {e}")
+                    logger.error(f"[SOCKS5] Telegram connection failed: {e}")
                     writer.close()
 
         except Exception as e:

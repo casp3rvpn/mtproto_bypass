@@ -1,0 +1,28 @@
+{
+  "proxy": {
+    "host": "0.0.0.0",
+    "port": 443,
+    "secret": "dab8774ccdd77053b587c9eb8b8a4564d38f812b591cc53c6a8dd7f0f8e78908"
+  },
+  "tls": {
+    "cert_path": "cert.pem",
+    "key_path": "key.pem"
+  },
+  "telegram": {
+    "host": "149.154.167.50",
+    "port": 443
+  },
+  "dpi_bypass": {
+    "enabled": true,
+    "real_website_host": "www.wikipedia.org",
+    "real_website_port": 443,
+    "fake_domain": "www.wikipedia.org",
+    "timeout": 2.0
+  },
+  "alternative_websites": [
+    "www.wikipedia.org",
+    "www.example.com",
+    "www.cloudflare.com",
+    "www.mozilla.org"
+  ]
+}

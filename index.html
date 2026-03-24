@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome - Secure Connection</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #333;
+        }
+        .container {
+            background: white;
+            padding: 3rem;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            text-align: center;
+            max-width: 500px;
+        }
+        h1 { color: #667eea; margin-bottom: 1rem; }
+        p { color: #666; line-height: 1.6; margin-bottom: 1.5rem; }
+        .icon { font-size: 4rem; margin-bottom: 1rem; }
+        .status {
+            display: inline-block;
+            padding: 0.5rem 1rem;
+            background: #e8f5e9;
+            color: #2e7d32;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            margin-top: 1rem;
+        }
+        .footer {
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid #eee;
+            font-size: 0.8rem;
+            color: #999;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🔒</div>
+        <h1>Secure Connection</h1>
+        <p>This connection is protected with end-to-end encryption.</p>
+        <p>All data transmitted through this channel is secured using industry-standard cryptographic protocols.</p>
+        <div class="status">✓ HTTPS Connection Established</div>
+        <div class="footer">
+            <p>Server: nginx/1.24.0</p>
+            <p>&copy; 2024 Secure Web Services</p>
+        </div>
+    </div>
+</body>
+</html>

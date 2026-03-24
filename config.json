@@ -2,6 +2,7 @@
   "proxy": {
     "host": "0.0.0.0",
     "port": 443,
+    "mtproto_port": 3128,
     "secret": "dab8774ccdd77053b587c9eb8b8a4564d38f812b591cc53c6a8dd7f0f8e78908"
   },
   "tls": {

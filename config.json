@@ -14,15 +14,16 @@
   },
   "dpi_bypass": {
     "enabled": true,
-    "real_website_host": "www.wikipedia.org",
+    "real_website_host": "ya.ru",
     "real_website_port": 443,
-    "fake_domain": "www.wikipedia.org",
+    "fake_domain": "ya.ru",
     "timeout": 2.0
   },
-  "alternative_websites": [
-    "www.wikipedia.org",
-    "www.example.com",
-    "www.cloudflare.com",
-    "www.mozilla.org"
+  "fallback_websites": [
+    ["ya.ru", 443],
+    ["mail.ru", 443],
+    ["www.yandex.ru", 443],
+    ["vk.com", 443],
+    ["mamba.ru", 443]
   ]
 }

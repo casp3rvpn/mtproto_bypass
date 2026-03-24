@@ -38,17 +38,17 @@ class ProxyConfig:
     secret: bytes = None
     tls_cert: str = "cert.pem"
     tls_key: str = "key.pem"
-    
-    # Real website configuration for DPI bypass
-    real_website_host: str = "www.wikipedia.org"  # Real site to proxy
+
+    # Real website configuration for DPI bypass (fallback list)
+    real_website_host: str = "ya.ru"
     real_website_port: int = 443
-    fake_domain: str = "www.wikipedia.org"
+    fake_domain: str = "ya.ru"
     fake_server: str = "nginx/1.24.0"
-    
+
     # Telegram relay
     telegram_host: str = "149.154.167.50"
     telegram_port: int = 443
-    
+
     # DPI detection settings
     dpi_timeout: float = 2.0  # Quick timeout for DPI probes
     enable_dpi_bypass: bool = True
@@ -144,31 +144,52 @@ class SNIParser:
 class RealWebsiteProxy:
     """Proxies requests to a real website for DPI bypass."""
     
+    # List of fallback websites for DPI bypass
+    WEBSITES = [
+        ("ya.ru", 443),
+        ("mail.ru", 443),
+        ("www.yandex.ru", 443),
+        ("vk.com", 443),
+        ("mamba.ru", 443),
+    ]
+
     def __init__(self, config: ProxyConfig):
         self.config = config
         self.session = None
-    
+
     async def fetch_website(self, host: str, path: str, headers: Dict[str, str]) -> Tuple[int, Dict[str, str], bytes]:
-        """Fetch content from real website."""
+        """Fetch content from real website with fallback support."""
+        for website_host, website_port in self.WEBSITES:
+            try:
+                return await self._fetch_from_host(website_host, website_port, path)
+            except Exception as e:
+                print(f"[-] Failed to fetch from {website_host}: {e}")
+                continue
+        
+        # All websites failed, return error page
+        return 502, {}, b"<h1>502 Bad Gateway</h1>"
+    
+    async def _fetch_from_host(self, host: str, port: int, path: str) -> Tuple[int, Dict[str, str], bytes]:
+        """Fetch content from specific host."""
+        # Create SSL context for upstream connection
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        # Connect with timeout
         try:
-            # Create SSL context for upstream connection
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # Connect to real website
-            reader, writer = await asyncio.open_connection(
-                self.config.real_website_host,
-                self.config.real_website_port,
-                ssl=ssl_context
-            )
-            
+            conn_future = asyncio.open_connection(host, port, ssl=ssl_context)
+            reader, writer = await asyncio.wait_for(conn_future, timeout=5.0)
+        except asyncio.TimeoutError:
+            raise Exception(f"Connection timeout to {host}")
+        
+        try:
             # Build HTTP request
             request = f"GET {path} HTTP/1.1\r\n"
-            request += f"Host: {self.config.real_website_host}\r\n"
+            request += f"Host: {host}\r\n"
             request += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
             request += "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n"
-            request += "Accept-Language: en-US,en;q=0.5\r\n"
+            request += "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8\r\n"
             request += "Accept-Encoding: gzip, deflate\r\n"
             request += "Connection: close\r\n"
             request += "\r\n"
@@ -176,17 +197,18 @@ class RealWebsiteProxy:
             writer.write(request.encode('utf-8'))
             await writer.drain()
             
-            # Read response
-            response = await reader.read(65536)
+            # Read response with timeout
+            response = await asyncio.wait_for(reader.read(65536), timeout=10.0)
+            
+        finally:
             writer.close()
-            await writer.wait_closed()
-            
-            # Parse response
-            return self._parse_response(response)
-            
-        except Exception as e:
-            print(f"[-] Website fetch error: {e}")
-            return 502, {}, b"<h1>502 Bad Gateway</h1>"
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        
+        # Parse response
+        return self._parse_response(response)
     
     def _parse_response(self, response: bytes) -> Tuple[int, Dict[str, str], bytes]:
         """Parse HTTP response from real website."""
@@ -221,43 +243,46 @@ class RealWebsiteProxy:
     
     async def proxy_full_connection(self, reader: asyncio.StreamReader,
                                      writer: asyncio.StreamWriter) -> None:
-        """Proxy entire HTTPS connection to real website."""
-        try:
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            
-            upstream_reader, upstream_writer = await asyncio.open_connection(
-                self.config.real_website_host,
-                self.config.real_website_port,
-                ssl=ssl_context
-            )
-            
-            async def forward(source, dest):
-                try:
-                    while True:
-                        data = await source.read(4096)
-                        if not data:
-                            break
-                        dest.write(data)
-                        await dest.drain()
-                except Exception:
-                    pass
-                finally:
-                    dest.close()
-            
-            await asyncio.gather(
-                forward(reader, upstream_writer),
-                forward(upstream_reader, writer),
-                return_exceptions=True
-            )
-            
-        except Exception as e:
-            print(f"[-] Full proxy error: {e}")
+        """Proxy entire HTTPS connection to real website with fallback."""
+        for host, port in self.WEBSITES:
             try:
-                writer.close()
-            except Exception:
-                pass
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port, ssl=ssl.create_default_context()),
+                    timeout=5.0
+                )
+                
+                async def forward(source, dest):
+                    try:
+                        while True:
+                            data = await source.read(4096)
+                            if not data:
+                                break
+                            dest.write(data)
+                            await dest.drain()
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            dest.close()
+                        except Exception:
+                            pass
+                
+                await asyncio.gather(
+                    forward(reader, upstream_writer),
+                    forward(upstream_reader, writer),
+                    return_exceptions=True
+                )
+                return  # Success, exit the function
+                
+            except Exception as e:
+                print(f"[-] Full proxy failed to {host}: {e}")
+                continue
+        
+        print(f"[-] All websites failed for full proxy")
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -583,15 +608,15 @@ class TLSContextManager:
             print(f"[SNI] Client requested: {server_name}")
     
     @staticmethod
-    def generate_self_signed_cert(cert_path: str, key_path: str, 
-                                   domain: str = "www.wikipedia.org") -> None:
+    def generate_self_signed_cert(cert_path: str, key_path: str,
+                                   domain: str = "ya.ru") -> None:
         """Generate self-signed certificate."""
         from cryptography import x509
         from cryptography.x509.oid import NameOID
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         import datetime
-        
+
         key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=2048,
@@ -708,19 +733,19 @@ class MTProtoProxyServer:
 async def main():
     """Main entry point."""
     secret = os.urandom(32)
-    
+
     config = ProxyConfig(
         host="0.0.0.0",
         port=443,
         secret=secret,
         tls_cert="cert.pem",
         tls_key="key.pem",
-        real_website_host="www.wikipedia.org",
-        fake_domain="www.wikipedia.org",
+        real_website_host="ya.ru",
+        fake_domain="ya.ru",
     )
-    
+
     server = MTProtoProxyServer(config)
-    
+
     try:
         await server.start()
     except KeyboardInterrupt:

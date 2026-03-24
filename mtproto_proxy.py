@@ -247,13 +247,28 @@ class ConnectionHandler:
         logger.info(f"[+] Connection from {peer[0]}:{peer[1]}")
 
         try:
-            # Read first bytes to detect protocol
-            initial = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+            # Read more data to properly detect protocol
+            # MTProto clients may send small packets first
+            initial = b''
+            while len(initial) < 64:  # Read at least 64 bytes
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=10.0)
+                if not chunk:
+                    break
+                initial += chunk
+                # Check if we have enough for detection
+                if len(initial) >= 8:
+                    if MTProtoFrame.is_mtproto(initial, self.config.secret):
+                        break
+                    if initial[0] == 0x16:  # TLS
+                        break
+                    if initial[0] == 0x05 and len(initial) >= 3:  # SOCKS5
+                        break
+
             if not initial:
                 writer.close()
                 return
 
-            logger.info(f"[Data] First bytes: {initial[:20].hex()}")
+            logger.info(f"[Data] First {len(initial)} bytes: {initial[:32].hex()}")
 
             # Detect protocol
             if MTProtoFrame.is_mtproto(initial, self.config.secret):
@@ -261,8 +276,10 @@ class ConnectionHandler:
                 await self._handle_mtproto(reader, writer, initial)
             elif initial[0] == 0x16:  # TLS handshake
                 logger.info("[TLS] TLS handshake detected - proxying to real website")
-                # Send initial data to upstream and proxy
                 await self._handle_tls(reader, writer, initial)
+            elif initial[0] == 0x05 and len(initial) >= 3:  # SOCKS5
+                logger.info("[SOCKS5] SOCKS5 detected")
+                await self._handle_socks5(reader, writer, initial)
             elif HTTPHandler.is_http(initial):
                 logger.info("[HTTP] HTTP request - serving website")
                 await self._handle_http(reader, writer, initial)
@@ -275,6 +292,103 @@ class ConnectionHandler:
             writer.close()
         except Exception as e:
             logger.error(f"[-] Error: {e}")
+            writer.close()
+
+    async def _handle_socks5(self, reader, writer, initial: bytes):
+        """Handle SOCKS5 connection."""
+        try:
+            # SOCKS5 handshake: client sends version(0x05), nmethods, methods
+            # We respond with: version(0x05), method(0x00 = no auth)
+            if len(initial) >= 3 and initial[0] == 0x05:
+                nmethods = initial[1]
+                # Respond with no authentication required
+                writer.write(b'\x05\x00')
+                await writer.drain()
+
+                # Read SOCKS5 request
+                request = await asyncio.wait_for(reader.read(262), timeout=5.0)
+                if not request or len(request) < 10:
+                    writer.close()
+                    return
+
+                # Parse request: version, cmd, rsv, atype, dst.addr, dst.port
+                cmd = request[1]
+                atype = request[3]
+
+                # Determine destination
+                offset = 4
+                if atype == 1:  # IPv4
+                    dst_ip = '.'.join(str(b) for b in request[offset:offset+4])
+                    offset += 4
+                elif atype == 3:  # Domain
+                    dst_len = request[offset]
+                    dst_ip = request[offset+1:offset+1+dst_len].decode()
+                    offset += 1 + dst_len
+                elif atype == 4:  # IPv6
+                    dst_ip = ':'.join(hex(b)[2:] for b in request[offset:offset+16])
+                    offset += 16
+                else:
+                    writer.close()
+                    return
+
+                dst_port = struct.unpack('>H', request[offset:offset+2])[0]
+
+                logger.info(f"[SOCKS5] Request: cmd={cmd} addr={dst_ip}:{dst_port}")
+
+                # Send success response
+                response = b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+                writer.write(response)
+                await writer.drain()
+
+                # Connect to destination
+                try:
+                    upstream_reader, upstream_writer = await asyncio.wait_for(
+                        asyncio.open_connection(dst_ip, dst_port),
+                        timeout=5.0
+                    )
+                    logger.info(f"[SOCKS5] Connected to {dst_ip}:{dst_port}")
+
+                    async def c2u():
+                        try:
+                            while True:
+                                data = await reader.read(4096)
+                                if not data:
+                                    break
+                                upstream_writer.write(data)
+                                await upstream_writer.drain()
+                        except Exception:
+                            pass
+                        finally:
+                            try:
+                                upstream_writer.close()
+                            except Exception:
+                                pass
+
+                    async def u2c():
+                        try:
+                            while True:
+                                data = await upstream_reader.read(4096)
+                                if not data:
+                                    break
+                                writer.write(data)
+                                await writer.drain()
+                        except Exception:
+                            pass
+                        finally:
+                            try:
+                                writer.close()
+                            except Exception:
+                                pass
+
+                    await asyncio.gather(c2u(), u2c(), return_exceptions=True)
+                    logger.info("[-] SOCKS5 session ended")
+
+                except Exception as e:
+                    logger.error(f"[SOCKS5] Connection failed: {e}")
+                    writer.close()
+
+        except Exception as e:
+            logger.error(f"[SOCKS5] Error: {e}")
             writer.close()
 
     async def _handle_mtproto(self, reader, writer, initial: bytes):
